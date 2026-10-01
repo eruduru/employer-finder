@@ -6,7 +6,7 @@ Run:   python employer_finder_app.py
 Open:  http://localhost:8080
 """
 
-import csv, io, json, math, os, re, sys, threading, time
+import csv, io, json, math, os, queue, re, sys, threading, time
 import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
@@ -431,6 +431,15 @@ WELFARE_ORGS = [
 ]
 
 
+# ── Result cache (30-min TTL) ─────────────────────────────────────────────────
+
+_CACHE     = {}   # key -> (timestamp, [results])
+CACHE_TTL  = 1800
+
+def _cache_key(prog, field, loc):
+    return f"{prog}:{field}:{loc.strip().lower()}"
+
+
 def _best_email(emails, hint=""):
     if not emails:
         return ""
@@ -445,34 +454,43 @@ def _best_email(emails, hint=""):
     return emails[0]
 
 
-def search(program_type, field_key, location, radius):
-    results  = []
-    lock     = threading.Lock()
-    seen_names = set()
+def search_stream(program_type, field_key, location, radius):
+    """
+    Generator — yields result dicts as they arrive from BA + OSM in parallel.
+    Caches full result list for 30 min so repeat searches are instant.
+    """
+    ck = _cache_key(program_type, field_key, location)
+    if ck in _CACHE:
+        ts, cached = _CACHE[ck]
+        if time.time() - ts < CACHE_TTL:
+            yield from cached
+            return
 
-    def add(record):
+    q          = queue.Queue()
+    DONE       = object()
+    all_res    = []
+    seen       = set()
+    lock       = threading.Lock()
+
+    def emit(record):
         key = record["name"].strip().lower()
         with lock:
-            if key and key not in seen_names:
-                seen_names.add(key)
-                results.append(record)
+            if key and key not in seen:
+                seen.add(key)
+                all_res.append(record)
+                q.put(record)
 
-    # Geocode first — everything else needs lat/lon
     lat, lon, _ = geocode(location)
     time.sleep(0.3)
 
     if program_type == "fsj":
         ba_terms = ["Freiwilliges Soziales Jahr"]
         osm_am   = ["hospital", "nursing_home", "kindergarten", "social_facility"]
-        osm_cr   = []
-        inst_lbl = "Soziale Einrichtung (FSJ)"
-        cat      = "FSJ Träger"
+        osm_cr   = []; inst_lbl = "Soziale Einrichtung (FSJ)";  cat = "FSJ Träger"
     elif program_type == "bfd":
         ba_terms = ["Bundesfreiwilligendienst"]
         osm_am   = ["hospital", "nursing_home", "kindergarten", "social_facility"]
-        osm_cr   = []
-        inst_lbl = "Soziale Einrichtung (BFD)"
-        cat      = "BFD Träger"
+        osm_cr   = []; inst_lbl = "Soziale Einrichtung (BFD)"; cat = "BFD Träger"
     else:
         cfg      = FIELDS.get(field_key, {})
         ba_terms = cfg.get("ba_terms", [field_key])[:1]
@@ -482,46 +500,52 @@ def search(program_type, field_key, location, radius):
         cat      = f"Ausbildung: {cfg.get('label', field_key)}"
 
     def ba_worker():
-        for term in ba_terms:
-            for rec in ba_search(term, location, radius, angebotsart="4", max_pages=3):
-                rec["category"] = cat if rec["category"] == "Arbeitgeber" else rec["category"]
-                add(rec)
+        try:
+            for term in ba_terms:
+                for rec in ba_search(term, location, radius, angebotsart="4", max_pages=3):
+                    rec["category"] = cat if rec["category"] == "Arbeitgeber" else rec["category"]
+                    emit(rec)
+        finally:
+            q.put(DONE)
 
     def osm_worker():
-        time.sleep(2)  # stagger so BA and OSM don't hit external APIs at the same instant
-        if lat is not None and (osm_am or osm_cr):
-            for rec in osm_search(lat, lon, radius, osm_am, osm_cr, inst_lbl):
-                add(rec)
+        try:
+            time.sleep(2)
+            if lat is not None and (osm_am or osm_cr):
+                for rec in osm_search(lat, lon, radius, osm_am, osm_cr, inst_lbl):
+                    emit(rec)
+        finally:
+            q.put(DONE)
 
-    # Run BA and OSM in parallel
-    t_ba  = threading.Thread(target=ba_worker,  daemon=True)
-    t_osm = threading.Thread(target=osm_worker, daemon=True)
-    t_ba.start()
-    t_osm.start()
-    t_ba.join(timeout=45)
-    t_osm.join(timeout=45)
+    threading.Thread(target=ba_worker,  daemon=True).start()
+    threading.Thread(target=osm_worker, daemon=True).start()
 
-    # For FSJ / BFD also add national welfare organisations
+    done_count = 0
+    while done_count < 2:
+        item = q.get(timeout=50)
+        if item is DONE:
+            done_count += 1
+        else:
+            yield item
+
+    # FSJ / BFD: national welfare orgs (fast, run after parallel workers finish)
     if program_type in ("fsj", "bfd"):
         for name, url, hint in WELFARE_ORGS:
             html = _fetch(url)
             if html:
                 emails = _emails(html)
                 domain = url.split("/")[2]
-                add({
-                    "name":      name,
-                    "category":  cat,
-                    "location":  "Bundesweit",
-                    "address":   "",
-                    "email":     _best_email(emails, hint),
-                    "phone":     "",
-                    "website":   f"https://{domain}",
-                    "source":    domain,
-                    "job_title": "",
-                })
+                rec = {
+                    "name": name, "category": cat, "location": "Bundesweit",
+                    "address": "", "email": _best_email(emails, hint),
+                    "phone": "", "website": f"https://{domain}",
+                    "source": domain, "job_title": "",
+                }
+                emit(rec)
+                yield rec
             time.sleep(0.5)
 
-    return results
+    _CACHE[ck] = (time.time(), list(all_res))
 
 
 # ── HTML UI ───────────────────────────────────────────────────────────────────
@@ -669,6 +693,7 @@ HTML = """<!DOCTYPE html>
 
 <script>
 let allResults = [];
+let activeSource = null;
 
 function onTypeChange(){
   const t = document.getElementById('type').value;
@@ -682,96 +707,105 @@ function setLoading(on){
 
 function statusMsg(msg){ document.getElementById('status').textContent = msg; }
 
-async function doSearch(){
+function doSearch(){
   const loc = document.getElementById('location').value.trim();
   if(!loc){ alert('Bitte einen Ort eingeben.'); return; }
-  const type   = document.getElementById('type').value;
-  const field  = document.getElementById('field').value;
-  const radius = 100;
+  const type  = document.getElementById('type').value;
+  const field = document.getElementById('field').value;
+
+  // Cancel any in-flight search
+  if(activeSource){ activeSource.close(); activeSource = null; }
 
   setLoading(true);
-  statusMsg('Suche läuft … (kann 30–90 Sekunden dauern)');
-  document.getElementById('results-card').style.display = 'none';
+  statusMsg('Suche läuft …');
   allResults = [];
+  document.getElementById('results-body').innerHTML = '';
+  document.getElementById('meta-row').innerHTML = '';
+  document.getElementById('results-card').style.display = 'none';
 
-  try {
-    const params = new URLSearchParams({type, field, location:loc, radius});
-    const resp   = await fetch('/api/search?' + params);
-    if(!resp.ok) throw new Error('Server error ' + resp.status);
-    allResults = await resp.json();
-    renderResults(allResults);
-    statusMsg('');
-  } catch(e){
-    statusMsg('Fehler: ' + e.message);
-  } finally {
+  const params = new URLSearchParams({type, field, location: loc, radius: 100});
+  const src = new EventSource('/api/search?' + params);
+  activeSource = src;
+
+  src.onmessage = (e) => {
+    const r = JSON.parse(e.data);
+    allResults.push(r);
+    appendRow(r, allResults.length);
+    updateMeta();
+    if(allResults.length === 1){
+      document.getElementById('results-card').style.display = '';
+    }
+    statusMsg(allResults.length + ' Ergebnisse …');
+  };
+
+  src.addEventListener('done', () => {
+    src.close(); activeSource = null;
     setLoading(false);
-  }
+    statusMsg('');
+    if(!allResults.length){
+      document.getElementById('results-body').innerHTML =
+        '<tr><td colspan="8" class="no-results">Keine Ergebnisse. Ort prüfen oder anderen Suchbegriff wählen.</td></tr>';
+      document.getElementById('results-card').style.display = '';
+    }
+    applyFilter();
+  });
+
+  src.onerror = () => {
+    src.close(); activeSource = null;
+    setLoading(false);
+    if(!allResults.length) statusMsg('Verbindungsfehler. Bitte erneut versuchen.');
+    else { statusMsg(''); applyFilter(); }
+  };
 }
 
 function categoryTag(cat){
   const c = cat.toLowerCase();
   if(c.includes('personal'))  return `<span class="tag tag-agency">${cat}</span>`;
-  if(c.startsWith('ausbildung') || c.includes('träger') || c.includes('direct'))
+  if(c.startsWith('ausbildung') || c.includes('träger'))
                                return `<span class="tag tag-direct">${cat}</span>`;
-  if(c.includes('osm') || c.includes('kita') || c.includes('kranken') || c.includes('alten'))
-                               return `<span class="tag tag-osm">${cat}</span>`;
-  return `<span class="tag tag-ba">${cat}</span>`;
+  return `<span class="tag tag-osm">${cat}</span>`;
 }
 
-function renderResults(data){
-  const tbody = document.getElementById('results-body');
-  const meta  = document.getElementById('meta-row');
-  tbody.innerHTML = '';
+function appendRow(r, i){
+  const email   = r.email   ? `<a href="mailto:${esc(r.email)}">${esc(r.email)}</a>` : '–';
+  const website = r.website
+    ? `<a href="${r.website.startsWith('http')?r.website:'https://'+r.website}" target="_blank" rel="noopener">Link</a>`
+    : '–';
+  const tr = document.createElement('tr');
+  tr.dataset.agency = r.category.toLowerCase().includes('personal') ? '1' : '0';
+  tr.dataset.search  = [r.name,r.category,r.location,r.email||'',r.address||''].join(' ').toLowerCase();
+  tr.innerHTML = `
+    <td>${i}</td>
+    <td><b>${esc(r.name)}</b>${r.job_title?'<br><small style="color:#94a3b8">'+esc(r.job_title)+'</small>':''}</td>
+    <td>${categoryTag(r.category)}</td>
+    <td>${esc(r.location)}</td>
+    <td>${email}</td>
+    <td>${esc(r.phone)||'–'}</td>
+    <td>${website}</td>
+    <td><small style="color:#94a3b8">${esc(r.source)}</small></td>`;
+  document.getElementById('results-body').appendChild(tr);
+}
 
-  const direct   = data.filter(r => !r.category.toLowerCase().includes('personal')).length;
-  const agencies = data.length - direct;
-  const withEmail = data.filter(r => r.email).length;
-
-  meta.innerHTML = `
-    <div class="meta-item">Gesamt: <b>${data.length}</b></div>
+function updateMeta(){
+  const direct    = allResults.filter(r => !r.category.toLowerCase().includes('personal')).length;
+  const agencies  = allResults.length - direct;
+  const withEmail = allResults.filter(r => r.email).length;
+  document.getElementById('meta-row').innerHTML = `
+    <div class="meta-item">Gesamt: <b>${allResults.length}</b></div>
     <div class="meta-item">Direktarbeitgeber / Einrichtungen: <b>${direct}</b></div>
     <div class="meta-item">Personaldienstleister: <b>${agencies}</b></div>
     <div class="meta-item">Mit E-Mail: <b>${withEmail}</b></div>`;
-
-  if(!data.length){
-    tbody.innerHTML = '<tr><td colspan="8" class="no-results">Keine Ergebnisse gefunden. Suchgebiet oder Begriff erweitern.</td></tr>';
-    document.getElementById('results-card').style.display = '';
-    return;
-  }
-
-  let i = 1;
-  for(const r of data){
-    const email   = r.email   ? `<a href="mailto:${r.email}">${r.email}</a>` : '–';
-    const website = r.website ? `<a href="${r.website.startsWith('http') ? r.website : 'https://'+r.website}" target="_blank" rel="noopener">Link</a>` : '–';
-    const tr = document.createElement('tr');
-    tr.dataset.agency = r.category.toLowerCase().includes('personal') ? '1' : '0';
-    tr.dataset.search  = [r.name,r.category,r.location,r.email,r.address].join(' ').toLowerCase();
-    tr.innerHTML = `
-      <td>${i++}</td>
-      <td><b>${esc(r.name)}</b>${r.job_title ? '<br><small style="color:#94a3b8">'+esc(r.job_title)+'</small>' : ''}</td>
-      <td>${categoryTag(r.category)}</td>
-      <td>${esc(r.location)}</td>
-      <td>${email}</td>
-      <td>${esc(r.phone)||'–'}</td>
-      <td>${website}</td>
-      <td><small style="color:#94a3b8">${esc(r.source)}</small></td>`;
-    tbody.appendChild(tr);
-  }
-  document.getElementById('results-card').style.display = '';
-  applyFilter();
 }
 
 function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 function applyFilter(){
-  const q      = document.getElementById('filter-input').value.toLowerCase();
-  const noAg   = document.getElementById('hide-agency').checked;
-  let visible  = 0;
+  const q    = document.getElementById('filter-input').value.toLowerCase();
+  const noAg = document.getElementById('hide-agency').checked;
   document.querySelectorAll('#results-body tr').forEach(tr => {
     if(!tr.dataset) return;
     const hide = (noAg && tr.dataset.agency==='1') || (q && !tr.dataset.search.includes(q));
     tr.style.display = hide ? 'none' : '';
-    if(!hide) visible++;
   });
 }
 
@@ -786,7 +820,6 @@ function exportCSV(){
   window.location = '/api/export?' + params;
 }
 
-// keyboard shortcut
 document.addEventListener('keydown', e => {
   if(e.key==='Enter' && e.target.id==='location') doSearch();
 });
@@ -825,40 +858,52 @@ class Handler(BaseHTTPRequestHandler):
             prog     = params.get("type", "fsj")
             field    = params.get("field", "erzieher")
             location = params.get("location", "")
-            radius   = 100
 
             if not location:
                 self._send(400, "application/json", b'{"error":"location required"}')
                 return
 
+            # Server-Sent Events stream
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
             try:
-                results = search(prog, field, location, radius)
-                self._send(200, "application/json; charset=utf-8",
-                           json.dumps(results, ensure_ascii=False))
-            except Exception as e:
-                self._send(500, "application/json",
-                           json.dumps({"error": str(e)}).encode())
+                for rec in search_stream(prog, field, location, 100):
+                    msg = "data: " + json.dumps(rec, ensure_ascii=False) + "\n\n"
+                    self.wfile.write(msg.encode("utf-8"))
+                    self.wfile.flush()
+                self.wfile.write(b"event: done\ndata: null\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         elif path == "/api/export":
             prog     = params.get("type", "fsj")
             field    = params.get("field", "erzieher")
             location = params.get("location", "")
-            radius   = 100
 
             if not location:
                 self._send(400, "text/plain", b"location required")
                 return
 
-            results = search(prog, field, location, radius)
-            buf     = io.StringIO()
-            w = csv.DictWriter(buf, fieldnames=[
+            # Use cache if available, otherwise stream-collect
+            ck = _cache_key(prog, field, location)
+            if ck in _CACHE and time.time() - _CACHE[ck][0] < CACHE_TTL:
+                results = _CACHE[ck][1]
+            else:
+                results = list(search_stream(prog, field, location, 100))
+
+            buf = io.StringIO()
+            w   = csv.DictWriter(buf, fieldnames=[
                 "name", "category", "location", "address",
                 "email", "phone", "website", "source", "job_title"
             ], extrasaction="ignore")
             w.writeheader()
             w.writerows(results)
 
-            fname = f"{prog}_{field}_{location}_{radius}km.csv".replace(" ", "_")
+            fname = f"{prog}_{field}_{location}_100km.csv".replace(" ", "_")
             body  = buf.getvalue().encode("utf-8-sig")
             self.send_response(200)
             self.send_header("Content-Type", "text/csv; charset=utf-8")
