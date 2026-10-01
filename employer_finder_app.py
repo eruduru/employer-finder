@@ -687,7 +687,7 @@ async function doSearch(){
   const field = document.getElementById('field').value;
 
   setLoading(true);
-  statusMsg('Suche läuft …');
+  statusMsg('Verbinde … (erster Aufruf kann 30 Sek. dauern)');
   allResults = [];
   document.getElementById('results-body').innerHTML = '';
   document.getElementById('meta-row').innerHTML     = '';
@@ -697,15 +697,14 @@ async function doSearch(){
   const baPromise  = fetch('/api/search?' + new URLSearchParams({type, field, location: loc}))
                        .then(r => r.json()).catch(() => []);
   const geoPromise = fetch('https://nominatim.openstreetmap.org/search?' +
-    new URLSearchParams({q: loc + ', Germany', format:'json', limit:1, countrycodes:'de'}),
-    {headers:{'User-Agent':'EmployerFinder/3.0'}})
+    new URLSearchParams({q: loc + ', Germany', format:'json', limit:1, countrycodes:'de'}))
     .then(r => r.json()).catch(() => []);
 
   // ── 2. Show BA results as soon as they arrive ────────────────────────────
   const baResults = await baPromise;
   for(const r of baResults){ addResult(r); }
   if(allResults.length) document.getElementById('results-card').style.display = '';
-  statusMsg(allResults.length + ' Ergebnisse (BA) — lade lokale Einrichtungen …');
+  statusMsg(allResults.length ? allResults.length + ' Ergebnisse gefunden — lade Einrichtungen …' : 'Lade lokale Einrichtungen …');
 
   // ── 3. OSM query runs client-side directly against Overpass ─────────────
   try {
