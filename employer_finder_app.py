@@ -454,81 +454,36 @@ def _best_email(emails, hint=""):
     return emails[0]
 
 
-def search_stream(program_type, field_key, location, radius):
+def ba_only(program_type, field_key, location):
     """
-    Generator — yields result dicts as they arrive from BA + OSM in parallel.
-    Caches full result list for 30 min so repeat searches are instant.
+    Returns BA Jobbörse results only — fast (~3-5s), used by /api/search.
+    OSM queries run client-side directly against Overpass (avoids US→DE server latency).
     """
     ck = _cache_key(program_type, field_key, location)
     if ck in _CACHE:
         ts, cached = _CACHE[ck]
         if time.time() - ts < CACHE_TTL:
-            yield from cached
-            return
-
-    q          = queue.Queue()
-    DONE       = object()
-    all_res    = []
-    seen       = set()
-    lock       = threading.Lock()
-
-    def emit(record):
-        key = record["name"].strip().lower()
-        with lock:
-            if key and key not in seen:
-                seen.add(key)
-                all_res.append(record)
-                q.put(record)
-
-    lat, lon, _ = geocode(location)
-    time.sleep(0.3)
+            return cached
 
     if program_type == "fsj":
-        ba_terms = ["Freiwilliges Soziales Jahr"]
-        osm_am   = ["hospital", "nursing_home", "kindergarten", "social_facility"]
-        osm_cr   = []; inst_lbl = "Soziale Einrichtung (FSJ)";  cat = "FSJ Träger"
+        ba_terms = ["Freiwilliges Soziales Jahr"]; cat = "FSJ Träger"
     elif program_type == "bfd":
-        ba_terms = ["Bundesfreiwilligendienst"]
-        osm_am   = ["hospital", "nursing_home", "kindergarten", "social_facility"]
-        osm_cr   = []; inst_lbl = "Soziale Einrichtung (BFD)"; cat = "BFD Träger"
+        ba_terms = ["Bundesfreiwilligendienst"];   cat = "BFD Träger"
     else:
         cfg      = FIELDS.get(field_key, {})
         ba_terms = cfg.get("ba_terms", [field_key])[:1]
-        osm_am   = cfg.get("osm_amenities", [])
-        osm_cr   = cfg.get("osm_crafts", [])
-        inst_lbl = cfg.get("inst_label", "Betrieb / Einrichtung")
         cat      = f"Ausbildung: {cfg.get('label', field_key)}"
 
-    def ba_worker():
-        try:
-            for term in ba_terms:
-                for rec in ba_search(term, location, radius, angebotsart="4", max_pages=3):
-                    rec["category"] = cat if rec["category"] == "Arbeitgeber" else rec["category"]
-                    emit(rec)
-        finally:
-            q.put(DONE)
+    seen, results = set(), []
+    for term in ba_terms:
+        for rec in ba_search(term, location, 100, angebotsart="4", max_pages=3):
+            rec["category"] = cat if rec["category"] == "Arbeitgeber" else rec["category"]
+            key = rec["name"].strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                results.append(rec)
 
-    def osm_worker():
-        try:
-            time.sleep(2)
-            if lat is not None and (osm_am or osm_cr):
-                for rec in osm_search(lat, lon, radius, osm_am, osm_cr, inst_lbl):
-                    emit(rec)
-        finally:
-            q.put(DONE)
-
-    threading.Thread(target=ba_worker,  daemon=True).start()
-    threading.Thread(target=osm_worker, daemon=True).start()
-
-    done_count = 0
-    while done_count < 2:
-        item = q.get(timeout=50)
-        if item is DONE:
-            done_count += 1
-        else:
-            yield item
-
-    # FSJ / BFD: national welfare orgs (fast, run after parallel workers finish)
+    # FSJ/BFD: add national welfare orgs
     if program_type in ("fsj", "bfd"):
         for name, url, hint in WELFARE_ORGS:
             html = _fetch(url)
@@ -541,14 +496,29 @@ def search_stream(program_type, field_key, location, radius):
                     "phone": "", "website": f"https://{domain}",
                     "source": domain, "job_title": "",
                 }
-                emit(rec)
-                yield rec
-            time.sleep(0.5)
+                key = name.strip().lower()
+                if key not in seen:
+                    seen.add(key)
+                    results.append(rec)
+            time.sleep(0.3)
 
-    _CACHE[ck] = (time.time(), list(all_res))
+    _CACHE[ck] = (time.time(), results)
+    return results
 
 
 # ── HTML UI ───────────────────────────────────────────────────────────────────
+
+def _build_osm_config():
+    """Emit JS object so client can query Overpass directly."""
+    cfg = {}
+    for key, f in FIELDS.items():
+        cfg[key] = {
+            "amenities": f["osm_amenities"],
+            "crafts":    f["osm_crafts"],
+            "label":     f["inst_label"],
+        }
+    return json.dumps(cfg)
+
 
 def _build_field_options():
     groups = {}
@@ -692,12 +662,15 @@ HTML = """<!DOCTYPE html>
 </div>
 
 <script>
+const OSM_CFG = OSM_CONFIG_PLACEHOLDER;
+const FSJ_OSM = {amenities:['hospital','nursing_home','kindergarten','social_facility'],crafts:[],label:'Soziale Einrichtung'};
+const BFD_OSM = {amenities:['hospital','nursing_home','kindergarten','social_facility'],crafts:[],label:'Soziale Einrichtung'};
+
 let allResults = [];
-let activeSource = null;
 
 function onTypeChange(){
-  const t = document.getElementById('type').value;
-  document.getElementById('field-wrap').style.display = t==='ausbildung' ? '' : 'none';
+  document.getElementById('field-wrap').style.display =
+    document.getElementById('type').value === 'ausbildung' ? '' : 'none';
 }
 
 function setLoading(on){
@@ -707,89 +680,130 @@ function setLoading(on){
 
 function statusMsg(msg){ document.getElementById('status').textContent = msg; }
 
-function doSearch(){
-  const loc = document.getElementById('location').value.trim();
+async function doSearch(){
+  const loc  = document.getElementById('location').value.trim();
   if(!loc){ alert('Bitte einen Ort eingeben.'); return; }
   const type  = document.getElementById('type').value;
   const field = document.getElementById('field').value;
-
-  // Cancel any in-flight search
-  if(activeSource){ activeSource.close(); activeSource = null; }
 
   setLoading(true);
   statusMsg('Suche läuft …');
   allResults = [];
   document.getElementById('results-body').innerHTML = '';
-  document.getElementById('meta-row').innerHTML = '';
+  document.getElementById('meta-row').innerHTML     = '';
   document.getElementById('results-card').style.display = 'none';
 
-  const params = new URLSearchParams({type, field, location: loc, radius: 100});
-  const src = new EventSource('/api/search?' + params);
-  activeSource = src;
+  // ── 1. BA Jobbörse (server-side) + Geocode run in parallel ──────────────
+  const baPromise  = fetch('/api/search?' + new URLSearchParams({type, field, location: loc}))
+                       .then(r => r.json()).catch(() => []);
+  const geoPromise = fetch('https://nominatim.openstreetmap.org/search?' +
+    new URLSearchParams({q: loc + ', Germany', format:'json', limit:1, countrycodes:'de'}),
+    {headers:{'User-Agent':'EmployerFinder/3.0'}})
+    .then(r => r.json()).catch(() => []);
 
-  src.onmessage = (e) => {
-    const r = JSON.parse(e.data);
-    allResults.push(r);
-    appendRow(r, allResults.length);
-    updateMeta();
-    if(allResults.length === 1){
-      document.getElementById('results-card').style.display = '';
-    }
-    statusMsg(allResults.length + ' Ergebnisse …');
-  };
+  // ── 2. Show BA results as soon as they arrive ────────────────────────────
+  const baResults = await baPromise;
+  for(const r of baResults){ addResult(r); }
+  if(allResults.length) document.getElementById('results-card').style.display = '';
+  statusMsg(allResults.length + ' Ergebnisse (BA) — lade lokale Einrichtungen …');
 
-  src.addEventListener('done', () => {
-    src.close(); activeSource = null;
-    setLoading(false);
-    statusMsg('');
-    if(!allResults.length){
-      document.getElementById('results-body').innerHTML =
-        '<tr><td colspan="8" class="no-results">Keine Ergebnisse. Ort prüfen oder anderen Suchbegriff wählen.</td></tr>';
-      document.getElementById('results-card').style.display = '';
+  // ── 3. OSM query runs client-side directly against Overpass ─────────────
+  try {
+    const geo = await geoPromise;
+    if(geo && geo.length){
+      const lat = parseFloat(geo[0].lat), lon = parseFloat(geo[0].lon);
+      const osmCfg = type === 'fsj' ? FSJ_OSM : type === 'bfd' ? BFD_OSM : (OSM_CFG[field] || {amenities:[],crafts:[],label:'Einrichtung'});
+      const osmRows = await queryOverpass(lat, lon, osmCfg);
+      for(const r of osmRows){ addResult(r); }
+      if(allResults.length) document.getElementById('results-card').style.display = '';
     }
-    applyFilter();
+  } catch(e){ /* OSM optional — don't block */ }
+
+  setLoading(false);
+  statusMsg('');
+  if(!allResults.length){
+    document.getElementById('results-body').innerHTML =
+      '<tr><td colspan="8" class="no-results">Keine Ergebnisse. Ort prüfen.</td></tr>';
+    document.getElementById('results-card').style.display = '';
+  }
+  applyFilter();
+}
+
+async function queryOverpass(lat, lon, cfg){
+  const km  = 20;
+  const dlat = km / 111.32;
+  const dlon = km / (111.32 * Math.cos(lat * Math.PI / 180));
+  const bb   = `${(lat-dlat).toFixed(4)},${(lon-dlon).toFixed(4)},${(lat+dlat).toFixed(4)},${(lon+dlon).toFixed(4)}`;
+  const parts = [
+    ...(cfg.amenities||[]).map(a => `  node["amenity"="${a}"](${bb});`),
+    ...(cfg.crafts||[]).map(c => `  node["craft"="${c}"](${bb});`),
+  ];
+  if(!parts.length) return [];
+  const query = `[out:json][timeout:25];\n(\n${parts.join('\n')}\n);\nout body 300;\n`;
+  const resp  = await fetch('https://overpass-api.de/api/interpreter', {
+    method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'data=' + encodeURIComponent(query),
   });
+  const data = await resp.json();
+  const results = [];
+  const seen = new Set();
+  for(const el of (data.elements||[])){
+    const name = (el.tags?.name||'').trim();
+    if(!name || seen.has(name)) continue;
+    seen.add(name);
+    const city   = el.tags?.['addr:city'] || el.tags?.['addr:suburb'] || '';
+    const street = el.tags?.['addr:street'] || '';
+    const nr     = el.tags?.['addr:housenumber'] || '';
+    const addr   = [street + (nr?' '+nr:''), city].filter(Boolean).join(', ');
+    results.push({
+      name, category: cfg.label, location: city || addr,
+      address: addr,
+      email:   el.tags?.email || el.tags?.['contact:email'] || '',
+      phone:   el.tags?.phone || el.tags?.['contact:phone'] || '',
+      website: el.tags?.website || el.tags?.['contact:website'] || '',
+      source:  'OpenStreetMap', job_title: '',
+    });
+    if(results.length >= 200) break;
+  }
+  return results;
+}
 
-  src.onerror = () => {
-    src.close(); activeSource = null;
-    setLoading(false);
-    if(!allResults.length) statusMsg('Verbindungsfehler. Bitte erneut versuchen.');
-    else { statusMsg(''); applyFilter(); }
-  };
+function addResult(r){
+  const key = (r.name||'').trim().toLowerCase();
+  if(!key) return;
+  allResults.push(r);
+  appendRow(r, allResults.length);
+  updateMeta();
 }
 
 function categoryTag(cat){
   const c = cat.toLowerCase();
-  if(c.includes('personal'))  return `<span class="tag tag-agency">${cat}</span>`;
-  if(c.startsWith('ausbildung') || c.includes('träger'))
-                               return `<span class="tag tag-direct">${cat}</span>`;
+  if(c.includes('personal')) return `<span class="tag tag-agency">${cat}</span>`;
+  if(c.startsWith('ausbildung')||c.includes('träger')) return `<span class="tag tag-direct">${cat}</span>`;
   return `<span class="tag tag-osm">${cat}</span>`;
 }
 
 function appendRow(r, i){
-  const email   = r.email   ? `<a href="mailto:${esc(r.email)}">${esc(r.email)}</a>` : '–';
+  const email   = r.email ? `<a href="mailto:${esc(r.email)}">${esc(r.email)}</a>` : '–';
   const website = r.website
-    ? `<a href="${r.website.startsWith('http')?r.website:'https://'+r.website}" target="_blank" rel="noopener">Link</a>`
-    : '–';
+    ? `<a href="${r.website.startsWith('http')?r.website:'https://'+r.website}" target="_blank" rel="noopener">Link</a>` : '–';
   const tr = document.createElement('tr');
   tr.dataset.agency = r.category.toLowerCase().includes('personal') ? '1' : '0';
-  tr.dataset.search  = [r.name,r.category,r.location,r.email||'',r.address||''].join(' ').toLowerCase();
+  tr.dataset.search = [r.name,r.category,r.location,r.email||'',r.address||''].join(' ').toLowerCase();
   tr.innerHTML = `
     <td>${i}</td>
     <td><b>${esc(r.name)}</b>${r.job_title?'<br><small style="color:#94a3b8">'+esc(r.job_title)+'</small>':''}</td>
-    <td>${categoryTag(r.category)}</td>
-    <td>${esc(r.location)}</td>
-    <td>${email}</td>
-    <td>${esc(r.phone)||'–'}</td>
-    <td>${website}</td>
+    <td>${categoryTag(r.category)}</td><td>${esc(r.location)}</td>
+    <td>${email}</td><td>${esc(r.phone)||'–'}</td><td>${website}</td>
     <td><small style="color:#94a3b8">${esc(r.source)}</small></td>`;
   document.getElementById('results-body').appendChild(tr);
 }
 
 function updateMeta(){
-  const direct    = allResults.filter(r => !r.category.toLowerCase().includes('personal')).length;
-  const agencies  = allResults.length - direct;
-  const withEmail = allResults.filter(r => r.email).length;
+  const direct   = allResults.filter(r=>!r.category.toLowerCase().includes('personal')).length;
+  const agencies = allResults.length - direct;
+  const withEmail= allResults.filter(r=>r.email).length;
   document.getElementById('meta-row').innerHTML = `
     <div class="meta-item">Gesamt: <b>${allResults.length}</b></div>
     <div class="meta-item">Direktarbeitgeber / Einrichtungen: <b>${direct}</b></div>
@@ -804,18 +818,17 @@ function applyFilter(){
   const noAg = document.getElementById('hide-agency').checked;
   document.querySelectorAll('#results-body tr').forEach(tr => {
     if(!tr.dataset) return;
-    const hide = (noAg && tr.dataset.agency==='1') || (q && !tr.dataset.search.includes(q));
-    tr.style.display = hide ? 'none' : '';
+    tr.style.display = ((noAg&&tr.dataset.agency==='1')||(q&&!tr.dataset.search.includes(q))) ? 'none' : '';
   });
 }
 
 function exportCSV(){
   if(!allResults.length){ alert('Keine Daten zum Exportieren.'); return; }
   const params = new URLSearchParams({
-    type:     document.getElementById('type').value,
-    field:    document.getElementById('field').value,
+    type: document.getElementById('type').value,
+    field: document.getElementById('field').value,
     location: document.getElementById('location').value,
-    radius:   100,
+    osm: JSON.stringify(allResults.filter(r=>r.source==='OpenStreetMap')),
   });
   window.location = '/api/export?' + params;
 }
@@ -826,7 +839,7 @@ document.addEventListener('keydown', e => {
 </script>
 </body>
 </html>
-""".replace("FIELD_OPTIONS", _build_field_options())
+""".replace("FIELD_OPTIONS", _build_field_options()).replace("OSM_CONFIG_PLACEHOLDER", _build_osm_config())
 
 
 # ── HTTP server ───────────────────────────────────────────────────────────────
@@ -863,21 +876,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, "application/json", b'{"error":"location required"}')
                 return
 
-            # Server-Sent Events stream
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
             try:
-                for rec in search_stream(prog, field, location, 100):
-                    msg = "data: " + json.dumps(rec, ensure_ascii=False) + "\n\n"
-                    self.wfile.write(msg.encode("utf-8"))
-                    self.wfile.flush()
-                self.wfile.write(b"event: done\ndata: null\n\n")
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+                results = ba_only(prog, field, location)
+                body    = json.dumps(results, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as e:
+                self._send(500, "application/json",
+                           json.dumps({"error": str(e)}).encode())
 
         elif path == "/api/export":
             prog     = params.get("type", "fsj")
@@ -888,13 +898,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, "text/plain", b"location required")
                 return
 
-            # Use cache if available, otherwise stream-collect
             ck = _cache_key(prog, field, location)
             if ck in _CACHE and time.time() - _CACHE[ck][0] < CACHE_TTL:
-                results = _CACHE[ck][1]
+                ba_results = _CACHE[ck][1]
             else:
-                results = list(search_stream(prog, field, location, 100))
+                ba_results = ba_only(prog, field, location)
 
+            # Merge with any client-supplied OSM rows
+            try:
+                osm_json = params.get("osm", "[]")
+                osm_rows = json.loads(osm_json)
+            except Exception:
+                osm_rows = []
+
+            results = ba_results + osm_rows
             buf = io.StringIO()
             w   = csv.DictWriter(buf, fieldnames=[
                 "name", "category", "location", "address",
