@@ -739,7 +739,7 @@ async function queryOverpass(lat, lon, cfg){
     ...(cfg.crafts||[]).map(c => `  node["craft"="${c}"](${bb});`),
   ];
   if(!parts.length) return [];
-  const query = `[out:json][timeout:25];\n(\n${parts.join('\n')}\n);\nout body 300;\n`;
+  const query = '[out:json][timeout:25];(' + parts.join('') + ');out body 300;';
   const resp  = await fetch('https://overpass-api.de/api/interpreter', {
     method:'POST',
     headers:{'Content-Type':'application/x-www-form-urlencoded'},
