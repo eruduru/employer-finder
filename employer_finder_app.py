@@ -446,64 +446,63 @@ def _best_email(emails, hint=""):
 
 
 def search(program_type, field_key, location, radius):
-    """
-    Returns list of result dicts.
-    program_type: 'fsj' | 'bfd' | 'ausbildung'
-    field_key:    key into FIELDS (only for ausbildung)
-    location:     city / address string
-    radius:       int km
-    """
-    results = []
+    results  = []
+    lock     = threading.Lock()
+    seen_names = set()
 
-    # 1 ── Geocode for OSM
-    lat, lon, display = geocode(location)
-    time.sleep(1.0)
+    def add(record):
+        key = record["name"].strip().lower()
+        with lock:
+            if key and key not in seen_names:
+                seen_names.add(key)
+                results.append(record)
 
-    # 2 ── BA Jobbörse
+    # Geocode first — everything else needs lat/lon
+    lat, lon, _ = geocode(location)
+    time.sleep(0.3)
+
     if program_type == "fsj":
-        ba_terms = ["Freiwilliges Soziales Jahr", "FSJ"]
+        ba_terms = ["Freiwilliges Soziales Jahr"]
         osm_am   = ["hospital", "nursing_home", "kindergarten", "social_facility"]
         osm_cr   = []
         inst_lbl = "Soziale Einrichtung (FSJ)"
         cat      = "FSJ Träger"
     elif program_type == "bfd":
-        ba_terms = ["Bundesfreiwilligendienst", "BFD"]
+        ba_terms = ["Bundesfreiwilligendienst"]
         osm_am   = ["hospital", "nursing_home", "kindergarten", "social_facility"]
         osm_cr   = []
         inst_lbl = "Soziale Einrichtung (BFD)"
         cat      = "BFD Träger"
     else:
         cfg      = FIELDS.get(field_key, {})
-        ba_terms = cfg.get("ba_terms", [field_key])
+        ba_terms = cfg.get("ba_terms", [field_key])[:1]
         osm_am   = cfg.get("osm_amenities", [])
         osm_cr   = cfg.get("osm_crafts", [])
         inst_lbl = cfg.get("inst_label", "Betrieb / Einrichtung")
         cat      = f"Ausbildung: {cfg.get('label', field_key)}"
 
-    seen_names = set()
+    def ba_worker():
+        for term in ba_terms:
+            for rec in ba_search(term, location, radius, angebotsart="4", max_pages=3):
+                rec["category"] = cat if rec["category"] == "Arbeitgeber" else rec["category"]
+                add(rec)
 
-    def add(record):
-        key = record["name"].strip().lower()
-        if key and key not in seen_names:
-            seen_names.add(key)
-            results.append(record)
+    def osm_worker():
+        time.sleep(2)  # stagger so BA and OSM don't hit external APIs at the same instant
+        if lat is not None and (osm_am or osm_cr):
+            for rec in osm_search(lat, lon, radius, osm_am, osm_cr, inst_lbl):
+                add(rec)
 
-    # BA Jobbörse (angebotsart=4 = Ausbildung/Freiwilligendienst only)
-    for term in ba_terms[:3]:  # limit to first 3 terms to keep speed reasonable
-        for rec in ba_search(term, location, radius, angebotsart="4"):
-            rec["category"] = cat if rec["category"] == "Arbeitgeber" else rec["category"]
-            add(rec)
-        time.sleep(0.8)
+    # Run BA and OSM in parallel
+    t_ba  = threading.Thread(target=ba_worker,  daemon=True)
+    t_osm = threading.Thread(target=osm_worker, daemon=True)
+    t_ba.start()
+    t_osm.start()
+    t_ba.join(timeout=45)
+    t_osm.join(timeout=45)
 
-    # OSM local institutions
-    if lat is not None and (osm_am or osm_cr):
-        for rec in osm_search(lat, lon, radius, osm_am, osm_cr, inst_lbl):
-            add(rec)
-        time.sleep(0.8)
-
-    # For FSJ / BFD also scrape welfare organisations
+    # For FSJ / BFD also add national welfare organisations
     if program_type in ("fsj", "bfd"):
-        url_idx = 1  # fsj URL index in WELFARE_ORGS tuples
         for name, url, hint in WELFARE_ORGS:
             html = _fetch(url)
             if html:
@@ -520,7 +519,7 @@ def search(program_type, field_key, location, radius):
                     "source":    domain,
                     "job_title": "",
                 })
-            time.sleep(0.8)
+            time.sleep(0.5)
 
     return results
 
